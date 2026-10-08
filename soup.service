@@ -1,0 +1,15 @@
+[Unit]
+Description=scx_soup sched_ext scheduler
+Documentation=file:///usr/local/bin/scx_soup
+After=multi-user.target
+ConditionPathExists=/sys/kernel/sched_ext/state
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/scx_soup -f
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
