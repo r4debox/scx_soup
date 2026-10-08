@@ -79,13 +79,10 @@ char LICENSE[] SEC("license") = "GPL";
 
 const volatile u64 rt_max_slice_ns  = 4000000;   /* 4ms: keep preemption fast */
 const volatile u64 batch_min_slice_ns = 20000000; /* 20ms: long uninterrupted run */
-const volatile u64 batch_min_run_ns   = 8000000;  /* >8ms continuous -> batch (spec) */
+const volatile u64 batch_min_run_ns   = 8000000;  /* batch evidence: slice >= 8ms */
 const volatile u64 interactive_slice_ns = 4000000; /* 4ms: cap-hit is a distinct signal */
-const volatile u64 beta_wake_ms   = 250;    /* wake latency EWMA alpha weight */
-const volatile u64 beta_slice_ms  = 150;    /* run slice EWMA alpha weight */
 const volatile u64 promote_win_ms = 3000;   /* re-eval window for promotion */
 const volatile u64 demote_win_ms  = 8000;   /* re-eval window for demotion */
-const volatile u64 max_vtime_diff_ns = 400000000; /* fairness bound */
 const volatile s32 idle_prefer_cpus = 0;    /* bitmask hint for tier-0 cores; 0 = auto */
 const volatile bool verbose = false;
 
@@ -216,6 +213,13 @@ static __always_inline struct task_metrics *get_metrics(u32 tid)
     return bpf_map_lookup_elem(&task_metrics_map, &tid);
 }
 
+/* verbose-gated trace: only fires when --verbose is set (rodata) */
+static __always_inline void vdbg(const char *msg, u64 a, u64 b)
+{
+    if (verbose)
+        bpf_printk("%s %llu %llu", msg, a, b);
+}
+
 /* Conservative EWMA: fraction = 1 << shift (hysteresis via promotion window) */
 static __always_inline u64 ewma_update(u64 old, u64 sample, u64 shift)
 {
@@ -294,18 +298,18 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
     if (m->klass == 3 && now - m->last_classify_ns < demote_win_ms * 1000000ULL)
         return 3; /* stickiness for batch */
 
-    if (slice >= (interactive_slice_ns * 3 / 4) && vsw < 250 && m->runs > 8)
+    if (slice >= batch_min_run_ns && vsw < 250 && m->runs > 8)
         return 3;
 
     /*
-     * Batch demote: symmetric with the promote gate (slice < 3/4 of the
-     * interactive cap), not the batch slice. batch_min_slice_ns is the
-     * SLICE HANDED OUT to batch tasks (20ms), so comparing slice < 20ms
-     * is dead weight: every batch task runs ~20ms slices and the promote
-     * check above already returns 3 for anything in [3ms, 20ms). Effective
-     * demote = the task stopped saturating its interactive cap.
+     * Batch demote: symmetric with the promote gate (slice < batch_min_run_ns
+     * = 8ms), not the batch slice. batch_min_slice_ns is the SLICE HANDED OUT
+     * to batch tasks (20ms), so comparing slice < 20ms would be dead weight:
+     * every batch task runs ~20ms slices and the promote check already
+     * returns 3 for anything in [8ms, 20ms). Effective demote = the task
+     * stopped running long enough to be batch.
      */
-    if (m->klass == 3 && slice < (interactive_slice_ns * 3 / 4) &&
+    if (m->klass == 3 && slice < batch_min_run_ns &&
         now - m->last_classify_ns > demote_win_ms * 1000000ULL)
         return 2; /* demoted back to interactive */
 
@@ -339,7 +343,7 @@ static __always_inline s32 pick_tier0_cpu(struct task_struct *p, s32 prev_cpu)
         if (!mask)
             return -1;
         for (u32 i = 0; i < nr; i++) {
-            if ((idle_prefer_cpus & (1u << i)) &&
+            if ((idle_prefer_cpus & (1ULL << i)) &&
                 bpf_cpumask_test_cpu(i, p->cpus_ptr))
                 bpf_cpumask_set_cpu(i, mask);
         }
@@ -349,7 +353,7 @@ static __always_inline s32 pick_tier0_cpu(struct task_struct *p, s32 prev_cpu)
             return cpu;
         /* no idle in the hint set: fall back to any allowed hint cpu */
         for (u32 i = 0; i < nr; i++) {
-            if ((idle_prefer_cpus & (1u << i)) &&
+            if ((idle_prefer_cpus & (1ULL << i)) &&
                 bpf_cpumask_test_cpu(i, p->cpus_ptr))
                 return i;
         }
@@ -390,7 +394,7 @@ s32 BPF_STRUCT_OPS(soup_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
         }
 
         s32 target = pick_tier0_cpu(p, prev_cpu);
-        bool target_is_idle = (target >= 0);
+        bool target_is_idle_hint = (target >= 0);
         if (target < 0)
             target = prev_cpu;
         if (target < 0)
@@ -415,7 +419,7 @@ s32 BPF_STRUCT_OPS(soup_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
              * which is BUSY: test_and_clear on a busy cpu lies to the kernel
              * and can defeat the preempt path.
              */
-            if (target_is_idle)
+            if (target_is_idle_hint)
                 scx_bpf_test_and_clear_cpu_idle(target);
             scx_bpf_kick_cpu(target, SCX_KICK_PREEMPT);
             scx_bpf_dsq_insert___v2(p, SCX_DSQ_LOCAL_ON | target,
@@ -475,6 +479,14 @@ void BPF_STRUCT_OPS(soup_enqueue, struct task_struct *p, u64 enq_flags)
     /* Re-classify unless within promotion window */
     s32 k = classify_task(m, now);
     set_klass(m, k, now);
+    if (verbose) {
+        if (k == 1)
+            vdbg("soup:rt", p->pid, m->vsw_ratio_ewma);
+        else if (k == 3)
+            vdbg("soup:batch", p->pid, m->slice_ewma);
+        else
+            vdbg("soup:int", p->pid, m->slice_ewma);
+    }
     if (k == 1)
         BUMP_PERCPU(dbg_classify_rt);
     else if (k == 3)

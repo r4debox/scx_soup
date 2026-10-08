@@ -89,10 +89,10 @@ The classifier runs on every enqueue. Each task carries a
 slice), vsw_ratio_ewma (EWMA of voluntary-switch ratio), sleep_ewma (EWMA of
 time asleep between enqueues; observability only, NOT used in classification).
 Classify: rt if vsw > 700 (the durable I/O/stream signature, after >= 4 runs)
-or slice < 1 ms from a non-rt task; batch if slice >= 3/4 of the interactive
-cap and vsw < 250 and runs > 8. rt and batch are sticky for promote_win_ms /
+or slice < 1 ms from a non-rt task; batch if slice >= batch_min_run_ns (8ms)
+and vsw < 250 and runs > 8. rt and batch are sticky for promote_win_ms /
 demote_win_ms respectively. The batch demote gate is symmetric with the
-promote gate (slice < 3/4 interactive cap), not the handed-out batch slice.
+promote gate (slice < batch_min_run_ns), not the handed-out batch slice.
 
 ## 4. Measured behavior
 
@@ -139,7 +139,7 @@ All rodata, overridable from the loader via skel->rodata:
 | rt_max_slice_ns         | rt slice length              |
 | batch_min_slice_ns      | batch slice length           |
 | interactive_slice_ns    | interactive slice cap        |
-| batch_min_run_ns        | batch evidence threshold     |
+| batch_min_run_ns        | batch evidence gate: slice >= this (8ms) |
 | idle_prefer_cpus        | restrict tier-0 cpus (bitmask, ANDed with allowed) |
 
 All overridable at runtime via argv, applied to rodata before load:
