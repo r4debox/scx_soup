@@ -4,7 +4,7 @@ In-kernel sched_ext CPU scheduler. No daemon, no user-space loop, no manual
 mode toggles. The BPF program classifies every task by its own behavior and
 routes it. Your radio never drops, your compile never stops.
 
-Author: shutterspeed (Calamity Jane), 2026.
+Author: r4debox (shutterspeed), 2026.
 Runs on the CachyOS borefinity kernel (CONFIG_SCHED_CLASS_EXT + BTF).
 Verified on an i5-8350U (4C/8T).
 
