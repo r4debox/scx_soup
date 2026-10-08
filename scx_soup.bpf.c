@@ -91,6 +91,7 @@ const volatile u64 batch_min_run_ns   = 8000000;  /* batch evidence: slice >= 8m
 const volatile u64 interactive_slice_ns = 4000000; /* 4ms: cap-hit is a distinct signal */
 const volatile u64 promote_win_ms = 3000;   /* re-eval window for promotion */
 const volatile u64 demote_win_ms  = 8000;   /* re-eval window for demotion */
+const volatile u64 max_stream_sleep_ns = 50000000; /* periodic-rt: sleep_ewma ceiling (50ms) */
 const volatile s32 idle_prefer_cpus = 0;    /* bitmask hint for tier-0 cores; 0 = auto */
 const volatile bool verbose = false;
 
@@ -284,8 +285,7 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
     u64 slice    = m->slice_ewma;
     u64 vsw      = m->vsw_ratio_ewma;
 
-    /*
-     * rt stickiness: once a stream, stay rt for the FULL demote window.
+    /* rt stickiness: once a stream, stay rt for the FULL demote window.
      * Using promote_win (3s) here lets a single vsw dip at the 3s re-eval
      * demote a real stream, and then it cannot recover: the rt slice (4ms)
      * raises slice_ewma so the slice < 1ms re-promote gate (line 303) can
@@ -310,15 +310,28 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
         return 1;
 
     /*
-     * Slice gate: a task that ACTUALLY ran a sub-ms slice is a micro-slicer
-     * by evidence, not by zero-init. runs >= 4 would force a fresh SDR/GUI
-     * task to burn 4 interactive slices (up to 20ms each under batch load)
-     * before it can preempt: a 26ms cold-start stall measured under 8x cc.
-     * The zero-init worry (slice_ewma == 0 promoting a never-run task) is
-     * harmless: it gets one 4ms rt slice, then classifies on real evidence,
-     * and the demote_win stickiness bounds any over-promotion. Never-run
-     * tasks also cannot hit this branch more than once.
+     * Periodic stream: task reliably sleeps more than it runs. This is the
+     * audio/DSP signature that the sub-ms slice gate misses: pipewire
+     * threads work 3-4ms per 10ms cycle, so slice_ewma ~3-4ms fails
+     * slice < 1ms, and vsw can dip below 700 when compile preemptions
+     * land on it. A task that sleeps >= 3x what it runs, every cycle, is
+     * a latency-sensitive stream even at multi-ms slices. Compilers sleep
+     * ~0 (ratio ~0) so they never match. sleep_ewma is "asleep + wake
+     * delay", and load-induced wake delay inflates the ratio upward: the
+     * right direction for a task that is falling behind.
+     *
+     * Short-sleep bound: bursty interactive tasks (shell waiting for a
+     * key, GUI between clicks) also sleep >> run, but their sleeps are
+     * LONG (10ms-1000ms+), not rhythmic. A stream's cycle is single-digit
+     * ms. Require sleep_ewma <= max_stream_sleep_ns so a shell that does
+     * one 500ms sleep-classify never grabs rt and holds it for the 8s
+     * stickiness window.
      */
+    if (m->runs >= 4 && m->slice_ewma &&
+        m->sleep_ewma <= max_stream_sleep_ns &&
+        m->sleep_ewma >= 3 * m->slice_ewma)
+        return 1;
+
     if (m->klass != 1 && slice < 1000000ULL)
         return 1;
 
