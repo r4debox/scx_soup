@@ -284,7 +284,16 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
     u64 slice    = m->slice_ewma;
     u64 vsw      = m->vsw_ratio_ewma;
 
-    if (m->klass == 1 && now - m->last_classify_ns < promote_win_ms * 1000000ULL)
+    /*
+     * rt stickiness: once a stream, stay rt for the FULL demote window.
+     * Using promote_win (3s) here lets a single vsw dip at the 3s re-eval
+     * demote a real stream, and then it cannot recover: the rt slice (4ms)
+     * raises slice_ewma so the slice < 1ms re-promote gate (line 303) can
+     * never fire, and it rides the interactive tier behind batch tasks
+     * until vsw recovers. Asymmetric with batch (which sticks 8s) and
+     * wrong for latency-sensitive tasks.
+     */
+    if (m->klass == 1 && now - m->last_classify_ns < demote_win_ms * 1000000ULL)
         return 1; /* stickiness for rt */
 
     /*
@@ -300,7 +309,17 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
     if (m->runs >= 4 && vsw > 700)
         return 1;
 
-    if (m->runs >= 4 && m->klass != 1 && slice < 1000000ULL)
+    /*
+     * Slice gate: a task that ACTUALLY ran a sub-ms slice is a micro-slicer
+     * by evidence, not by zero-init. runs >= 4 would force a fresh SDR/GUI
+     * task to burn 4 interactive slices (up to 20ms each under batch load)
+     * before it can preempt: a 26ms cold-start stall measured under 8x cc.
+     * The zero-init worry (slice_ewma == 0 promoting a never-run task) is
+     * harmless: it gets one 4ms rt slice, then classifies on real evidence,
+     * and the demote_win stickiness bounds any over-promotion. Never-run
+     * tasks also cannot hit this branch more than once.
+     */
+    if (m->klass != 1 && slice < 1000000ULL)
         return 1;
 
     if (m->klass == 3 && now - m->last_classify_ns < demote_win_ms * 1000000ULL)
@@ -404,9 +423,15 @@ s32 BPF_STRUCT_OPS(soup_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
         s32 target = pick_tier0_cpu(p, prev_cpu);
         bool target_is_idle_hint = (target >= 0);
         if (target < 0)
-            target = prev_cpu;
-        if (target < 0)
+            /* no idle cpu anywhere (full saturation): preempt the WAKER's
+             * cpu. The wakeup context IS the preemption point; kicking
+             * prev_cpu instead means waiting for that (busy) cpu's next
+             * tick, which under a 20ms batch slice is 1-6ms of tail. The
+             * waker cpu preempts instantly: it is already in the wakeup
+             * path and the running task there is the one to displace. */
             target = bpf_get_smp_processor_id();
+        if (target < 0)
+            target = prev_cpu;
 
         /*
          * Only insert to a target cpu if it's allowed for this task and
