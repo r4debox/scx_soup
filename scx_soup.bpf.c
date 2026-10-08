@@ -4,21 +4,25 @@
  * An in-kernel sched_ext scheduler that classifies tasks live and forwards
  * them into one of three tiers with ZERO userspace involvement:
  *
- *   TIER 0  low-latency streams (SDR, audio, input): INSERT to the target
- *           cpu's local DSQ from select_cpu(). No queue hop. A dedicated
- *           idle core is preferred; slice is short so wakeups preempt fast.
+ *   TIER 0  low-latency streams (SDR, audio, input): dispatched to a target
+ *           cpu's local DSQ from select_cpu() with SCX_ENQ_PREEMPT. A
+ *           dedicated idle core is preferred; slice is short (4ms) so
+ *           wakeups preempt fast.
  *
- *   TIER 1  interactive / default: normal SCX_DSQ_GLOBAL behavior, vtime
- *           weighted fair share with a modest slice.
+ *   TIER 1  interactive / default: normal local-DSQ behavior with a modest
+ *           slice.
  *
- *   TIER 2  batch absorption (make, cargo, ninja, clang): vtime insert into
- *           a custom low-priority DSQ that is drained ONLY when nothing
- *           else is runnable on the cpu.
+ *   TIER 2  batch absorption (make, cargo, ninja, clang): long slice (20ms)
+ *           on the local DSQ. No custom DSQ, no ops.dispatch: on this kernel
+ *           that combination changes local-rq auto-drain semantics and
+ *           causes runnable-task stalls. Long-slice-on-local gives the same
+ *           tier separation: batch fills idle cycles, rt preempts it
+ *           instantly.
  *
  * Everything is decided in-kernel. The BPF program owns the tunables
  * (rodata), the classifier, and the queue plumbing. The only "userspace"
- * piece is a libbpf loader that attaches the program and (optionally) pins
- * stats to bpffs so it can be observed without a daemon.
+ * piece is a libbpf loader that attaches the program and prints per-cpu
+ * stats; no daemon is required for scheduling decisions.
  *
  * ABI: this targets Linux 7.2 with the cid-based sched_ext ops
  * (scx_bpf_dsq_insert___v2, select_cpu_and, local DSQ via
@@ -27,6 +31,10 @@
  * BPF object + loader.
  *
  * Copyright 2026 shutterspeed, GPL-2.0
+ *
+ * sched_ext interface and the vendored headers under third_party/ are
+ * from sched-ext/scx (GPL-2.0, Copyright Meta Platforms, Tejun Heo,
+ * David Vernet). See README section 8.
  */
 #include "common.bpf.h"
 #include "user_exit_info.bpf.h"

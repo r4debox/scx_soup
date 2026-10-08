@@ -3,6 +3,10 @@
  * No profiler, no classify, no rt path. enqueue -> SCX_DSQ_LOCAL,
  * select_cpu -> default. If THIS stalls, the bug is in my ops/loader/ABI;
  * if not, bisect the profiler back in.
+ *
+ * SPDX-License-Identifier: GPL-2.0
+ * Copyright 2026 shutterspeed
+ * sched_ext headers from sched-ext/scx (GPL-2.0, Meta/Heo/Vernet).
  */
 #include "common.bpf.h"
 #include "user_exit_info.bpf.h"

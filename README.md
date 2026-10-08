@@ -4,8 +4,9 @@ In-kernel sched_ext CPU scheduler. No daemon, no user-space loop, no manual
 mode toggles. The BPF program classifies every task by its own behavior and
 routes it. Your radio never drops, your compile never stops.
 
-Forked from the `scx_autodirect` experiment. Runs on the CachyOS borefinity
-kernel (CONFIG_SCHED_CLASS_EXT + BTF). Verified on an i5-8350U (4C/8T).
+Author: shutterspeed (Calamity Jane), 2026.
+Runs on the CachyOS borefinity kernel (CONFIG_SCHED_CLASS_EXT + BTF).
+Verified on an i5-8350U (4C/8T).
 
 ## 1. Specification
 
@@ -155,7 +156,11 @@ All overridable at runtime via argv, applied to rodata before load:
 
 ## 8. Licensing
 
-GPL-2.0. The headers under third_party/scx/include are vendored from
-sched-ext/scx (SPDX GPL-2.0, Copyright Meta Platforms / Tejun Heo /
-David Vernet), the reference sched_ext scheduler suite; they are included
-verbatim so the project builds without libscx or meson.
+Copyright 2026 shutterspeed. GPL-2.0.
+
+The sched_ext interface and the vendored headers under third_party/scx/include
+are from sched-ext/scx, the reference sched_ext scheduler suite (SPDX GPL-2.0,
+Copyright Meta Platforms, Tejun Heo, David Vernet). They are included verbatim
+so the project builds without libscx or meson. Any sched_ext ABI knowledge in
+this codebase traces to that upstream; the classification logic, tiering, and
+loader are original to scx_soup.

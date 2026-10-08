@@ -15,6 +15,8 @@
  *   systemd unit + scx_loader-style auto-start are covered by
  *   soup.service so it comes up at boot before any SDR app.
  *
+ * Copyright 2026 shutterspeed, GPL-2.0
+ *
  * Usage:
  *   scx_soup [-f] [-s SECONDS] [--rt-max-slice NS]
  *                  [--batch-min-slice NS] [--interactive-slice NS]

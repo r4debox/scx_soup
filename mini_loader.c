@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Copyright 2026 shutterspeed. libbpf loader for minimal.bpf.o (debug). */
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
