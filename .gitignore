@@ -4,7 +4,9 @@
 vmlinux.h
 scx_soup
 mini_loader
--l
+
+# Benchmark scratch
+bench/out/
 
 # Editor / OS junk
 *.swp
