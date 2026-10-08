@@ -10,6 +10,10 @@ ExecStart=/usr/local/bin/scx_soup -f
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=2
+# If another sched_ext scheduler is active (or soup is already up), attach
+# fails with exit 2: stop hammering instead of an infinite restart loop.
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target

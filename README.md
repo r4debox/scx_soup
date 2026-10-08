@@ -17,8 +17,7 @@ Verified on an i5-8350U (4C/8T).
 | User-space daemons   | none required                        |
 | Slice, rt tier       | rt_max_slice_ns (rodata, default)    |
 | Slice, batch tier    | batch_min_slice_ns (rodata, default) |
-| Promote window       | promote_win_ms, rt stickiness        |
-| Demote window        | demote_win_ms, batch stickiness      |
+| Stickiness window    | demote_win_ms (both classes)         |
 | Metrics              | EWMA per-task: slice, vsw ratio, wake latency |
 | Classification       | in-BPF, every enqueue                |
 | Preemption           | SCX_ENQ_PREEMPT on rt wakeups        |
@@ -88,12 +87,14 @@ Verified on an i5-8350U (4C/8T).
 The classifier runs on every enqueue. Each task carries a
 `struct task_metrics` in a hash map keyed by pid: slice_ewma (EWMA of on-cpu
 slice), vsw_ratio_ewma (EWMA of voluntary-switch ratio), sleep_ewma (EWMA of
-time asleep between enqueues; observability only, NOT used in classification).
+time asleep between enqueues; drives the periodic-stream gate).
 Classify: rt if vsw > 700 (the durable I/O/stream signature, after >= 4 runs)
-or slice < 1 ms from a non-rt task; batch if slice >= batch_min_run_ns (8ms)
-and vsw < 250 and runs > 8. rt and batch are sticky for promote_win_ms /
-demote_win_ms respectively. The batch demote gate is symmetric with the
-promote gate (slice < batch_min_run_ns), not the handed-out batch slice.
+or slice < 1 ms (cold-start protection, first ~4 runs only) or sleep >> run
+(periodic stream, sleep_ewma >= 1.5x slice_ewma and <= 50ms); batch if slice >=
+batch_min_run_ns (3ms) and vsw < 250 and runs > 8. rt and batch are sticky
+for demote_win_ms (8s), stamped only on class change so the window measures
+real silence. The batch demote gate is symmetric with the promote gate
+(slice < batch_min_run_ns), not the handed-out batch slice.
 
 ## 4. Measured behavior
 
@@ -135,12 +136,12 @@ All rodata, overridable from the loader via skel->rodata:
 
 | Symbol                  | Effect                       |
 |-------------------------|------------------------------|
-| promote_win_ms          | rt stickiness window         |
-| demote_win_ms           | batch stickiness window      |
+| demote_win_ms           | stickiness window (both classes) |
 | rt_max_slice_ns         | rt slice length              |
 | batch_min_slice_ns      | batch slice length           |
 | interactive_slice_ns    | interactive slice cap        |
-| batch_min_run_ns        | batch evidence gate: slice >= this (8ms) |
+| batch_min_run_ns        | batch entry gate: slice >= this (3ms) |
+| max_stream_sleep_ns     | periodic-rt sleep ceiling (50ms) |
 | idle_prefer_cpus        | restrict tier-0 cpus (bitmask, ANDed with allowed) |
 
 All overridable at runtime via argv, applied to rodata before load:

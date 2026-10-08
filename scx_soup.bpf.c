@@ -87,11 +87,11 @@ char LICENSE[] SEC("license") = "GPL";
 
 const volatile u64 rt_max_slice_ns  = 4000000;   /* 4ms: keep preemption fast */
 const volatile u64 batch_min_slice_ns = 20000000; /* 20ms: long uninterrupted run */
-const volatile u64 batch_min_run_ns   = 8000000;  /* batch evidence: slice >= 8ms */
+const volatile u64 batch_min_run_ns   = 3000000;  /* batch entry: slice >= 3ms (interactive*3/4) */
 const volatile u64 interactive_slice_ns = 4000000; /* 4ms: cap-hit is a distinct signal */
-const volatile u64 promote_win_ms = 3000;   /* re-eval window for promotion */
-const volatile u64 demote_win_ms  = 8000;   /* re-eval window for demotion */
+const volatile u64 demote_win_ms  = 8000;   /* stickiness window (both classes) */
 const volatile u64 max_stream_sleep_ns = 50000000; /* periodic-rt: sleep_ewma ceiling (50ms) */
+#define COLD_RT_RUNS 4  /* cold-start preempt protection window (runs) */
 const volatile s32 idle_prefer_cpus = 0;    /* bitmask hint for tier-0 cores; 0 = auto */
 const volatile bool verbose = false;
 
@@ -120,6 +120,7 @@ struct task_metrics {
     u32 prio;              /* sched priority snapshot */
     u8  klass;             /* 0=unknown 1=rt_stream 2=interactive 3=batch */
     u8  in_rt;             /* sticky flag, cleared after demote window */
+    u8  cold_rt;           /* 1 = rt via cold-start gate (NOT sticky) */
 };
 
 struct {
@@ -272,29 +273,29 @@ static __always_inline u64 now_ns(void)
  *             gate applies ONLY to tasks not already rt: once a task gets a
  *             rt slice (4ms), the slice EWMA rises and slice < 1ms can never
  *             be true again, so gating stay-rt on slice would churn tasks
- *             out every promote_win. vsw is the only durable rt signal.
+ *             every demote window. vsw is the only durable rt signal.
  *  Batch:     slice >= 3/4 of the interactive cap (saturating) AND vsw < 250
  *             AND runs > 8 (enough history)
  *  Otherwise interactive.
  *
- * Hysteresis: once rt_stream, stay rt_stream for promote_win_ms; once batch,
- * need vsw to rise / slice to fall for demote_win_ms before re-eval.
+ * Hysteresis: once rt_stream, stay rt_stream for demote_win; once batch,
+ * stay batch for demote_win. Class-change-only stamping means the window
+ * measures real silence, not activity.
  */
 static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
 {
     u64 slice    = m->slice_ewma;
     u64 vsw      = m->vsw_ratio_ewma;
 
-    /* rt stickiness: once a stream, stay rt for the FULL demote window.
-     * Using promote_win (3s) here lets a single vsw dip at the 3s re-eval
-     * demote a real stream, and then it cannot recover: the rt slice (4ms)
-     * raises slice_ewma so the slice < 1ms re-promote gate (line 303) can
-     * never fire, and it rides the interactive tier behind batch tasks
-     * until vsw recovers. Asymmetric with batch (which sticks 8s) and
-     * wrong for latency-sensitive tasks.
-     */
-    if (m->klass == 1 && now - m->last_classify_ns < demote_win_ms * 1000000ULL)
-        return 1; /* stickiness for rt */
+    /* The hysteresis comment / stale promote_win reference: promote_win
+     * is DEAD (was the rt stickiness window; stickiness now uses
+     * demote_win and only re-arms on class change). The window cannot
+     * lapse while a task re-enqueues: set_klass stamps last_classify_ns
+     * only on a CLASS CHANGE, not every enqueue, so 'now - last < win'
+     * measures real silence, not activity. */
+    if (m->klass == 1 && !m->cold_rt &&
+        now - m->last_classify_ns < demote_win_ms * 1000000ULL)
+        return 1; /* stickiness for rt (durable classifications only) */
 
     /*
      * rt requires EVIDENCE: a zero-initialized task would trivially satisfy
@@ -306,15 +307,22 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
      * hands out a rt_max_slice (4ms), slice_ewma rises and the slice gate
      * would self-erode, so stay-rt must rest on vsw alone.
      */
-    if (m->runs >= 4 && vsw > 700)
+    if (m->runs >= 4 && vsw > 700) {
+        /* durable signal: this rt is sticky from here on. If the task
+         * previously entered via the cold gate, drop the non-sticky marker
+         * and re-arm the stickiness window (last_classify was stamped at
+         * cold entry; it must reflect THIS durable promotion). */
+        m->cold_rt = 0;
+        m->last_classify_ns = now;
         return 1;
+    }
 
     /*
      * Periodic stream: task reliably sleeps more than it runs. This is the
      * audio/DSP signature that the sub-ms slice gate misses: pipewire
      * threads work 3-4ms per 10ms cycle, so slice_ewma ~3-4ms fails
      * slice < 1ms, and vsw can dip below 700 when compile preemptions
-     * land on it. A task that sleeps >= 3x what it runs, every cycle, is
+     * land on it. A task that sleeps >= 1.5x what it runs, every cycle, is
      * a latency-sensitive stream even at multi-ms slices. Compilers sleep
      * ~0 (ratio ~0) so they never match. sleep_ewma is "asleep + wake
      * delay", and load-induced wake delay inflates the ratio upward: the
@@ -329,11 +337,39 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
      */
     if (m->runs >= 4 && m->slice_ewma &&
         m->sleep_ewma <= max_stream_sleep_ns &&
-        m->sleep_ewma >= 3 * m->slice_ewma)
+        m->sleep_ewma >= 15 * m->slice_ewma / 10) {
+        /* durable signal (same re-arm as the vsw gate above) */
+        m->cold_rt = 0;
+        m->last_classify_ns = now;
         return 1;
+    }
 
-    if (m->klass != 1 && slice < 1000000ULL)
+    /* DIAG removed: periodic gate proven (diag showed 1.7-1.95x ratios). */
+
+    /*
+     * Cold-start preempt protection: a fresh task gets its first
+     * COLD_RT_RUNS as rt so it can establish its profile WITHOUT eating a
+     * batch slice. This is one-shot and NON-sticky (cold_rt): a compiler
+     * escapes rt at runs >= COLD_RT_RUNS and can accumulate batch evidence;
+     * a stream re-asserts rt via vsw/periodic (which is sticky). Without
+     * this, a fresh 3ms-work audio thread spends its first 4-15 runs as
+     * interactive (EWMA warmup) waiting behind 20ms batch slices: glitches.
+     * Stickiness (the durable stream signal) is vsw > 700 or the periodic
+     * gate, both of which require real history.
+     *
+     * cold_rt marks the classification as NON-sticky, permanently: the
+     * rt-sticky check above skips tasks with cold_rt, so a compiler that
+     * entered rt via this gate falls back to interactive/batch the moment
+     * runs >= COLD_RT_RUNS (re-evaluated every enqueue, no 8s sticky hold
+     * that would outlive a 2-4s compile). A REAL stream re-asserts rt via
+     * vsw > 700 / periodic on every classify, so it doesn't need the
+     * sticky window while its evidence holds; if its evidence dips, it
+     * demotes, which is correct.
+     */
+    if (m->klass != 1 && m->runs < COLD_RT_RUNS) {
+        m->cold_rt = 1;  /* stays set: this task's rt is NEVER sticky */
         return 1;
+    }
 
     if (m->klass == 3 && now - m->last_classify_ns < demote_win_ms * 1000000ULL)
         return 3; /* stickiness for batch */
@@ -356,14 +392,27 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
     return 2;
 }
 
-static __always_inline void set_klass(struct task_metrics *m, s32 k, u64 now)
+static __always_inline bool set_klass(struct task_metrics *m, s32 k, u64 now)
 {
-    m->klass = k;
-    if (k == 1)
-        m->in_rt = 1;      /* sticky: promoted by the classifier */
-    else if (k != 1 && m->in_rt)
-        m->in_rt = 0;      /* demoted: no longer rt */
-    m->last_classify_ns = now;
+    /*
+     * Stamp last_classify_ns ONLY on a class change. Stamping every call
+     * (with classify on every enqueue) makes the stickiness window measure
+     * activity, not silence: a busy rt task re-enqueues every few ms so
+     * 'now - last < win' never lapses, and it is rt forever. With the
+     * class-change-only stamp, the window measures REAL time since the
+     * last transition; a task that holds a class for demote_win (8s) of
+     * real silence is re-evaluated.
+     */
+    if (k != m->klass) {
+        m->klass = k;
+        if (k == 1)
+            m->in_rt = 1;      /* sticky: promoted by the classifier */
+        else if (k != 1 && m->in_rt)
+            m->in_rt = 0;      /* demoted: no longer rt */
+        m->last_classify_ns = now;
+        return true;  /* class changed: caller may trace/bump */
+    }
+    return false;
 }
 
 /*
@@ -391,13 +440,13 @@ static __always_inline s32 pick_tier0_cpu(struct task_struct *p, s32 prev_cpu)
         bpf_cpumask_release(mask);
         if (cpu >= 0)
             return cpu;
-        /* no idle in the hint set: fall back to any allowed hint cpu */
-        for (u32 i = 0; i < nr; i++) {
-            if ((idle_prefer_cpus & (1ULL << i)) &&
-                bpf_cpumask_test_cpu(i, p->cpus_ptr))
-                return i;
-        }
-        return -1;
+        /* no idle in the hint set: return the busy sentinel (-2), NOT a busy
+         * hint cpu. Returning a busy cpu >= 0 makes the caller read
+         * target_is_idle_hint=true and claim an idle cpu that is busy,
+         * lying to the kernel and defeating the preempt path (the caller's
+         * own comment says exactly this). The caller will fall back to the
+         * waker cpu under saturation and skip the idle claim. */
+        return -2; /* hint set but all busy: sentinel, not idle */
     }
 
     /* auto: idle cpu in the task's allowed mask */
@@ -436,7 +485,8 @@ s32 BPF_STRUCT_OPS(soup_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
         s32 target = pick_tier0_cpu(p, prev_cpu);
         bool target_is_idle_hint = (target >= 0);
         if (target < 0)
-            /* no idle cpu anywhere (full saturation): preempt the WAKER's
+            /* no idle cpu anywhere (pick returned -1) or nothing allowed
+             * in the idle_prefer hint (returned -2): preempt the WAKER's
              * cpu. The wakeup context IS the preemption point; kicking
              * prev_cpu instead means waiting for that (busy) cpu's next
              * tick, which under a 20ms batch slice is 1-6ms of tail. The
@@ -519,19 +569,32 @@ void BPF_STRUCT_OPS(soup_enqueue, struct task_struct *p, u64 enq_flags)
      */
     if (m->last_enq_ns) {
         u64 slept = now - m->last_enq_ns;
-        m->sleep_ewma = ewma_update(m->sleep_ewma, slept, 4); /* alpha 1/16 */
+        /*
+         * Skip sub-1ms samples: under rt-vs-rt collisions a task can be
+         * re-enqueued before it actually slept (wake delay dominates), and
+         * those ~0 samples erode the periodic-stream signal (sleep_ewma
+         * gets dragged toward 0). A real stream's inter-cycle sleep is
+         * single-digit ms; samples under 1ms carry no stream information.
+         */
+        if (slept > 1000000ULL)
+            m->sleep_ewma = ewma_update(m->sleep_ewma, slept, 4); /* alpha 1/16 */
     }
 
     /* Re-classify unless within promotion window */
     s32 k = classify_task(m, now);
-    set_klass(m, k, now);
+    bool changed = set_klass(m, k, now);
+    /* verbose trace ONLY on class transitions: tracing every classify is
+     * a bpf_printk storm under load (83k/s measured). Transitions are the
+     * interesting signal, and they're rare. */
     if (verbose) {
-        if (k == 1)
-            vdbg("soup:rt", p->pid, m->vsw_ratio_ewma);
-        else if (k == 3)
-            vdbg("soup:batch", p->pid, m->slice_ewma);
-        else
-            vdbg("soup:int", p->pid, m->slice_ewma);
+        if (changed) {
+            if (k == 1)
+                vdbg("soup:rt", p->pid, m->vsw_ratio_ewma);
+            else if (k == 3)
+                vdbg("soup:batch", p->pid, m->slice_ewma);
+            else
+                vdbg("soup:int", p->pid, m->slice_ewma);
+        }
     }
     if (k == 1)
         BUMP_PERCPU(dbg_classify_rt);
@@ -542,11 +605,19 @@ void BPF_STRUCT_OPS(soup_enqueue, struct task_struct *p, u64 enq_flags)
 
     if (k == 1) {
         /*
-         * BISECT: enqueue-side LOCAL_ON insert + kick suspected in the 30s
-         * stall (counters freeze ~1s after attach). Route rt-classified
-         * tasks through the plain local DSQ for now.
+         * rt enqueue path (select_cpu defaulted or klass was stale): must
+         * PREEMPT. Plain SCX_DSQ_LOCAL with enq_flags (no PREEMPT) enqueues
+         * the rt task BEHIND whatever runs on the waker cpu: under a 20ms
+         * batch slice that is a 20ms+ stall, stacking to 100ms+ on repeat
+         * wakeups. Kick + PREEMPT the waker cpu so the rt task runs now.
+         * (The old BISECT workaround routed rt through the plain local DSQ
+         * to dodge a 30s stall during bring-up; that stall is gone and the
+         * workaround is what the audio glitches came back as.)
          */
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, rt_max_slice_ns, enq_flags);
+        s32 cur = bpf_get_smp_processor_id();
+        scx_bpf_kick_cpu(cur, SCX_KICK_PREEMPT);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, rt_max_slice_ns,
+                           SCX_ENQ_CPU_SELECTED | SCX_ENQ_PREEMPT);
         BUMP_PERCPU(rt_wake_count);
         return;
     }

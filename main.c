@@ -65,9 +65,10 @@ static void usage(const char *prog)
         "  --rt-max-slice NS       tier0 slice\n"
         "  --batch-min-slice NS    tier2 slice\n"
         "  --interactive-slice NS  tier1 slice\n"
-        "  --batch-min-run NS      classify threshold\n"
-        "  --promote-ms MS         promotion window\n"
-        "  --demote-ms MS          demotion window\n"
+        "  --batch-min-run NS      classify threshold (default 3ms)\n"
+        "  --promote-ms MS         stickiness window (alias for --demote-ms)\n"
+        "  --demote-ms MS          stickiness window for both classes\n"
+        "  --max-stream-sleep NS   periodic-stream sleep ceiling (default 50ms)\n"
         "  --idle-prefer-cpus MASK explicit tier0 cpu hint (bitmask)\n"
         "  --verbose\n",
         prog);
@@ -163,6 +164,7 @@ int main(int argc, char **argv)
         { "demote-ms",          required_argument, NULL, 1006 },
         { "idle-prefer-cpus",   required_argument, NULL, 1007 },
         { "verbose",            no_argument,       NULL, 1008 },
+        { "max-stream-sleep",   required_argument, NULL, 1009 },
         { NULL, 0, NULL, 0 }
     };
 
@@ -171,6 +173,7 @@ int main(int argc, char **argv)
     /* rodata overrides from argv, applied after open() below */
     u64 o_rt_max_slice = 0, o_batch_min_slice = 0, o_interactive_slice = 0;
     u64 o_batch_min_run = 0, o_promote_ms = 0, o_demote_ms = 0;
+    u64 o_max_stream_sleep = 0;
     s32 o_idle_prefer = 0;
     int o_verbose = 0;
 
@@ -187,6 +190,7 @@ int main(int argc, char **argv)
         case 1006: o_demote_ms = strtoull(optarg, NULL, 0); break;
         case 1007: o_idle_prefer = strtol(optarg, NULL, 0); break;
         case 1008: o_verbose = 1; break;
+        case 1009: o_max_stream_sleep = strtoull(optarg, NULL, 0); break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -202,9 +206,10 @@ int main(int argc, char **argv)
     if (o_batch_min_slice)   skel->rodata->batch_min_slice_ns = o_batch_min_slice;
     if (o_interactive_slice) skel->rodata->interactive_slice_ns = o_interactive_slice;
     if (o_batch_min_run)     skel->rodata->batch_min_run_ns = o_batch_min_run;
-    if (o_promote_ms)        skel->rodata->promote_win_ms = o_promote_ms;
+    if (o_promote_ms)        skel->rodata->demote_win_ms = o_promote_ms;
     if (o_demote_ms)         skel->rodata->demote_win_ms = o_demote_ms;
     if (o_idle_prefer)       skel->rodata->idle_prefer_cpus = o_idle_prefer;
+    if (o_max_stream_sleep)  skel->rodata->max_stream_sleep_ns = o_max_stream_sleep;
     if (o_verbose)           skel->rodata->verbose = true;
 
     if (scx_soup_bpf__load(skel)) {
@@ -213,10 +218,16 @@ int main(int argc, char **argv)
     }
 
     link = bpf_map__attach_struct_ops(skel->maps.soup_ops);
-    if (!link) {
-        fprintf(stderr, "failed to attach sched_ext ops: %s\n", strerror(errno));
-        goto out;
-    }
+        if (!link) {
+            /* EBUSY: another sched_ext scheduler is attached, or soup already
+             * running (the loader's own pidfile check below races attach).
+             * This is a config error, not a code bug: exit 2 so a systemd
+             * StartLimit can back off instead of an infinite restart loop. */
+            fprintf(stderr, "failed to attach sched_ext ops: %s (exit 2; is another scheduler active?)\n",
+                    strerror(errno));
+            ret = 2;
+            goto out;
+        }
 
     if (!foreground) {
         if (daemonize())
