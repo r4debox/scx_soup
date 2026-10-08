@@ -101,9 +101,9 @@ struct task_metrics {
     /*
      * EWMA of sleep time (ns), updated in enqueue. last_enq_ns is stamped
      * in stopping(), so the enqueue delta is "time asleep + wake delay",
-     * NOT wake-to-run latency. Kept for observability only; classification
-     * deliberately does NOT gate on it (wake latency is the outcome we are
-     * protecting, gating on it inverts the feedback).
+     * NOT wake-to-run latency. Drives the periodic-stream gate (classify_task);
+     * it is NOT a direct latency gate (wake latency is the outcome we are
+     * protecting; gating on it inverts the feedback).
      */
     u64 sleep_ewma;
     /* EWMA of last observed run slice (ns), updated in stopping() */
@@ -259,9 +259,9 @@ static __always_inline u64 now_ns(void)
  * the re-eval path.
  *
  * Signals (EWMAs in struct task_metrics):
- *  - sleep_ewma: time asleep between enqueues (observability only; NOT used
- *    in classification. See the struct comment on why gating on it would
- *    invert the feedback).
+ *  - sleep_ewma: time asleep between enqueues. Drives the periodic-stream
+ *    gate (sleep > 1.5x run on a short cycle = stream). NOT a latency gate:
+ *    gating on wake latency would invert the feedback loop.
  *  - slice_ewma: actual run slice. A task that consistently SATURATES the
  *    interactive slice cap (4ms) and almost never yields voluntarily is
  *    compute-bound: promote to batch (longer slices, background DSQ).
@@ -379,10 +379,10 @@ static __always_inline s32 classify_task(struct task_metrics *m, u64 now)
 
     /*
      * Batch demote: symmetric with the promote gate (slice < batch_min_run_ns
-     * = 8ms), not the batch slice. batch_min_slice_ns is the SLICE HANDED OUT
+     * = 3ms), not the batch slice. batch_min_slice_ns is the SLICE HANDED OUT
      * to batch tasks (20ms), so comparing slice < 20ms would be dead weight:
      * every batch task runs ~20ms slices and the promote check already
-     * returns 3 for anything in [8ms, 20ms). Effective demote = the task
+     * returns 3 for anything in [3ms, 20ms). Effective demote = the task
      * stopped running long enough to be batch.
      */
     if (m->klass == 3 && slice < batch_min_run_ns &&
@@ -418,7 +418,9 @@ static __always_inline bool set_klass(struct task_metrics *m, s32 k, u64 now)
 /*
  * Pick a target cpu for a tier-0 task. Prefer an idle core in the process's
  * allowed cpumask; if idle_prefer_cpus (bitmask) is set, restrict selection
- * to (hint & allowed). Returns -1 when no idle cpu is available; the caller
+ * to (hint & allowed). Returns an idle cpu >= 0, or -1 when no idle cpu is
+ * available, or -2 when idle_prefer_cpus is set but every candidate in the
+ * hint is busy (caller must NOT claim idle; falls back to the waker cpu).
  * falls back to prev_cpu / current.
  */
 static __always_inline s32 pick_tier0_cpu(struct task_struct *p, s32 prev_cpu)
@@ -564,8 +566,8 @@ void BPF_STRUCT_OPS(soup_enqueue, struct task_struct *p, u64 enq_flags)
     /*
      * Sample sleep time: time between this enqueue and the last enqueue
      * that ended in a stopping(). last_enq_ns is stamped in stopping(), so
-     * the delta is how long the task slept (plus wake delay). Kept for
-     * observability; not used in classification.
+     * the delta is how long the task slept (plus wake delay). Feeds
+     * sleep_ewma, which drives the periodic-stream gate; see classify_task.
      */
     if (m->last_enq_ns) {
         u64 slept = now - m->last_enq_ns;
@@ -610,9 +612,9 @@ void BPF_STRUCT_OPS(soup_enqueue, struct task_struct *p, u64 enq_flags)
          * the rt task BEHIND whatever runs on the waker cpu: under a 20ms
          * batch slice that is a 20ms+ stall, stacking to 100ms+ on repeat
          * wakeups. Kick + PREEMPT the waker cpu so the rt task runs now.
-         * (The old BISECT workaround routed rt through the plain local DSQ
-         * to dodge a 30s stall during bring-up; that stall is gone and the
-         * workaround is what the audio glitches came back as.)
+         * (Historical note: a bring-up BISECT routed rt through the plain
+         * local DSQ to dodge a 30s stall. The stall is long gone; round 2
+         * restored the PREEMPT path and this is the correct behavior.)
          */
         s32 cur = bpf_get_smp_processor_id();
         scx_bpf_kick_cpu(cur, SCX_KICK_PREEMPT);
